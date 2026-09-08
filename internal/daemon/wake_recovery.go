@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"os"
 	"slices"
 	"time"
 
@@ -59,7 +60,7 @@ func (s *Service) restoreOpenInternal(ctx context.Context) error {
 	}
 	restoreCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	resolved, err := config.ResolveHyprlandConfig("", s.cfg.MonitorsConf, s.cfg.HyprConfig)
+	resolved, err := s.wakeHyprConfig(restoreCtx)
 	if err != nil {
 		return err
 	}
@@ -68,7 +69,7 @@ func (s *Service) restoreOpenInternal(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		_, err = s.client.Eval(restoreCtx, code)
+		_, err = s.client.Eval(restoreCtx, "do\n"+code+"\nend")
 		return err
 	}
 	for _, output := range p.Outputs {
@@ -102,4 +103,19 @@ func (s *Service) wakeRecovered(monitors []hypr.Monitor) bool {
 		}
 	}
 	return true
+}
+
+// Startup discovers the running dialect while IPC is healthy. Reuse it during
+// recovery rather than letting an empty version silently select legacy syntax.
+func (s *Service) wakeHyprConfig(ctx context.Context) (config.ResolvedHyprConfig, error) {
+	s.wakeConfigMu.RLock()
+	cached := s.wakeConfig
+	s.wakeConfigMu.RUnlock()
+	if cached != nil {
+		return *cached, nil
+	}
+	if s.cfg.HyprConfig != "" || os.Getenv("HYPRLAND_CONFIG") != "" {
+		return config.ResolveHyprlandConfig("", s.cfg.MonitorsConf, s.cfg.HyprConfig)
+	}
+	return s.resolveHyprConfig(ctx)
 }

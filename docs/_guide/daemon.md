@@ -18,7 +18,7 @@ This is especially useful if you move between setups regularly. A conference pro
 
 ## Recovery after sleep
 
-Resume and lid-open explicitly request display recovery. The daemon first restores an enabled internal panel's saved mode, scale, and position, using its last known hardware mapping. This step does not need a successful monitor-list query or a ready external display. It then wakes outputs and reconciles the full profile.
+Resume and lid-open explicitly request display recovery. The daemon first restores an enabled internal panel's saved mode, scale, and position, using its last known hardware mapping. This step reuses the configuration format detected at startup and does not need a successful monitor-list query or a ready external display. It then wakes outputs and reconciles the full profile.
 
 A transient IPC failure or DPMS-off state during that wake does not cancel recovery. The daemon retries for up to 45 seconds, stopping when the outputs recover, the lid closes, the system suspends again, or management is turned off. Ordinary idle blanking does not start recovery. An explicit panel-disable preference is preserved, and an active interactive preview keeps ownership of its layout.
 

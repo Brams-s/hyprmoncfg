@@ -47,6 +47,8 @@ type Service struct {
 	store          *profile.Store
 	engine         apply.Engine
 	cfg            Config
+	wakeConfigMu   sync.RWMutex
+	wakeConfig     *config.ResolvedHyprConfig
 	writeMu        sync.Mutex
 	pendingMu      sync.Mutex
 	pending        *pendingTransaction
@@ -504,18 +506,17 @@ func (s *Service) resolveHyprConfig(ctx context.Context) (config.ResolvedHyprCon
 		version = info.Version
 	}
 	cancel()
-	return config.ResolveHyprlandConfig(version, s.cfg.MonitorsConf, s.cfg.HyprConfig)
+	resolved, err := config.ResolveHyprlandConfig(version, s.cfg.MonitorsConf, s.cfg.HyprConfig)
+	if err == nil && version != "" {
+		s.wakeConfigMu.Lock()
+		s.wakeConfig = &resolved
+		s.wakeConfigMu.Unlock()
+	}
+	return resolved, err
 }
 
 func (s *Service) ensureConfigInclude(ctx context.Context) {
-	version := ""
-	versionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	if info, err := s.client.Version(versionCtx); err == nil {
-		version = info.Version
-	}
-	cancel()
-
-	resolved, err := config.ResolveHyprlandConfig(version, s.cfg.MonitorsConf, s.cfg.HyprConfig)
+	resolved, err := s.resolveHyprConfig(ctx)
 	if err != nil {
 		s.cfg.Logf("could not resolve the Hyprland config: %v", err)
 		return
@@ -585,14 +586,12 @@ func (s *Service) wakeDisplays(ctx context.Context) {
 	wakeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	version := ""
-	if info, err := s.client.Version(wakeCtx); err == nil {
-		version = info.Version
+	resolved, err := s.wakeHyprConfig(wakeCtx)
+	if err != nil {
+		s.cfg.Logf("could not resolve wake configuration: %v", err)
+		return
 	}
-	luaDispatch := false
-	if resolved, err := config.ResolveHyprlandConfig(version, s.cfg.MonitorsConf, s.cfg.HyprConfig); err == nil {
-		luaDispatch = resolved.Format == config.HyprConfigLua
-	}
+	luaDispatch := resolved.Format == config.HyprConfigLua
 	if err := s.client.WakeDisplays(wakeCtx, luaDispatch); err != nil {
 		s.cfg.Logf("could not wake displays: %v", err)
 	}

@@ -212,3 +212,73 @@ func TestResumeRetriesAfterIPCFailureWithoutAnotherHardwareEvent(t *testing.T) {
 	// No lid event, monitor event, or regular poll follows. Only the retry can recover.
 	waitFor(t, 2*time.Second, func() bool { return env.logs.contains("display wake recovery complete") }, "independent retry")
 }
+
+func TestWakeKeepsDetectedLuaDialectWhenIPCIsUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	hyprDir := filepath.Join(dir, "hypr")
+	if err := os.MkdirAll(hyprDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"hyprland.lua", "hyprland.conf"} {
+		if err := os.WriteFile(filepath.Join(hyprDir, name), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("HYPRLAND_CONFIG", "")
+	t.Setenv("HYPRMONCFG_MONITORS_CONF", "")
+	t.Setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-wake")
+	t.Setenv("WAKE_TEST_DIR", dir)
+	script := `#!/bin/bash
+for ((i=1; i<=$#; i++)); do
+  case ${!i} in
+    version)
+      [[ ! -e "$WAKE_TEST_DIR/fail" ]] || exit 1
+      echo '{"version":"0.56.2"}'
+      exit 0
+      ;;
+    eval)
+      ((i++))
+      code=${!i}
+      # hyprctl parses an argument starting with -- as an option, even after eval.
+      [[ $code != -* ]] || exit 2
+      printf '%s' "$code" > "$WAKE_TEST_DIR/eval"
+      echo ok
+      exit 0
+      ;;
+    keyword) exit 3 ;;
+  esac
+done
+exit 4
+`
+	if err := os.WriteFile(filepath.Join(dir, "hyprctl"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	client, err := hypr.NewClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(client, profile.NewStore(t.TempDir()), Config{})
+	if _, err := svc.resolveHyprConfig(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fail"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	svc.lidState = lid.Open
+	svc.lastProfile = profile.Profile{Outputs: []profile.OutputConfig{{Name: "eDP-1", Enabled: true, Width: 2880, Height: 1800, Scale: 1.5}}}
+	svc.writeMu.Lock()
+	err = svc.restoreOpenInternal(context.Background())
+	svc.writeMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := os.ReadFile(filepath.Join(dir, "eval"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(code), "do\n") || !strings.Contains(string(code), `output = "eDP-1"`) {
+		t.Fatalf("incorrect Lua recovery command: %s", code)
+	}
+}
