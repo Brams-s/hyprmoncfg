@@ -20,14 +20,16 @@ import (
 )
 
 type Config struct {
-	Debounce        time.Duration
-	WakeSettle      time.Duration
-	PollInterval    time.Duration
-	LidPollInterval time.Duration
-	EventRetry      time.Duration
-	ForcedProfile   string
-	MonitorsConf    string
-	HyprConfig      string
+	Debounce   time.Duration
+	WakeSettle time.Duration
+	// WakeRecoveryTimeout bounds retries after explicit resume/lid-open events.
+	WakeRecoveryTimeout time.Duration
+	PollInterval        time.Duration
+	LidPollInterval     time.Duration
+	EventRetry          time.Duration
+	ForcedProfile       string
+	MonitorsConf        string
+	HyprConfig          string
 	// ConfigDir is where the managed/unmanaged choice is recorded, so it
 	// outlives a daemon restart. Empty means always managed.
 	ConfigDir string
@@ -136,6 +138,9 @@ func New(client *hypr.Client, store *profile.Store, cfg Config) *Service {
 	if cfg.WakeSettle <= 0 {
 		cfg.WakeSettle = 2 * time.Second
 	}
+	if cfg.WakeRecoveryTimeout <= 0 {
+		cfg.WakeRecoveryTimeout = 45 * time.Second
+	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 5 * time.Second
 	}
@@ -214,6 +219,26 @@ func (s *Service) Run(ctx context.Context) error {
 	pollTicker := time.NewTicker(s.cfg.PollInterval)
 	defer pollTicker.Stop()
 
+	// A failed resume is not an intentional idle blank. Keep a bounded recovery
+	// window independent of monitor events: a blocked IPC query may consume the
+	// only hotplug event, and DPMS-on cannot re-enable a clamshell-disabled panel.
+	recoveryTimer := time.NewTimer(time.Hour)
+	recoveryTimer.Stop()
+	defer recoveryTimer.Stop()
+	var recoveryDeadline time.Time
+	recovering := func() bool { return config.IsManaged(s.cfg.ConfigDir) && time.Now().Before(recoveryDeadline) }
+	startRecovery := func() {
+		if !config.IsManaged(s.cfg.ConfigDir) {
+			return
+		}
+		recoveryDeadline = time.Now().Add(s.cfg.WakeRecoveryTimeout)
+		recoveryTimer.Reset(s.cfg.WakeSettle)
+	}
+	stopRecovery := func() {
+		recoveryDeadline = time.Time{}
+		recoveryTimer.Stop()
+	}
+
 	debounceTimer := time.NewTimer(s.cfg.Debounce)
 	if !debounceTimer.Stop() {
 		<-debounceTimer.C
@@ -222,6 +247,12 @@ func (s *Service) Run(ctx context.Context) error {
 	pending := false
 	settlingAfterWake := false
 	displayGuard := displaySleepGuard{}
+	observePower := func(monitors []hypr.Monitor) displaySleepTransition {
+		if recovering() {
+			return displaySleepUnchanged
+		}
+		return displayGuard.Observe(monitors)
+	}
 	stopDebounce := func() {
 		if !debounceTimer.Stop() {
 			select {
@@ -251,6 +282,18 @@ func (s *Service) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-recoveryTimer.C:
+			if !recovering() {
+				s.cfg.Logf("display recovery window expired; awaiting the next wake or lid event")
+				continue
+			}
+			s.refreshLidState(ctx)
+			wakeCtx, cancel := context.WithDeadline(ctx, recoveryDeadline)
+			s.wakeDisplays(wakeCtx)
+			cancel()
+			displayGuard.sleeping = false
+			pushTrigger("wake-retry", s.cfg.WakeSettle)
+			recoveryTimer.Reset(s.cfg.WakeSettle * 2)
 		case err, ok := <-eventErrs:
 			if !ok {
 				eventErrs = nil
@@ -285,7 +328,7 @@ func (s *Service) Run(ctx context.Context) error {
 					continue
 				}
 			} else {
-				switch displayGuard.Observe(monitors) {
+				switch observePower(monitors) {
 				case displaySleepEntered:
 					s.cfg.Logf("display sleep detected; pausing automatic switching")
 					deferForDisplaySleep(reason)
@@ -313,6 +356,10 @@ func (s *Service) Run(ctx context.Context) error {
 				continue
 			}
 			if sleeping {
+				if recovering() {
+					s.cfg.Logf("suspending; stopped display wake recovery")
+				}
+				stopRecovery()
 				s.cfg.LaptopToggle.Reset()
 				// A lid close that suspends the machine must not be applied on
 				// resume: by then the lid is usually open again, and honoring
@@ -326,6 +373,7 @@ func (s *Service) Run(ctx context.Context) error {
 				continue
 			}
 			s.cfg.Logf("resumed from sleep; waking displays")
+			startRecovery()
 			s.cfg.LaptopToggle.Reset()
 			s.refreshLidState(ctx)
 			s.wakeDisplays(ctx)
@@ -343,6 +391,7 @@ func (s *Service) Run(ctx context.Context) error {
 				s.clearManualOverride()
 				reason := "lid:" + string(state)
 				if state == lid.Open {
+					startRecovery()
 					// Opening the lid is an explicit ask for light. Wake the
 					// displays instead of waiting for a keypress to do it.
 					s.wakeDisplays(ctx)
@@ -350,6 +399,8 @@ func (s *Service) Run(ctx context.Context) error {
 						displayGuard.sleeping = false
 						settlingAfterWake = true
 					}
+				} else {
+					stopRecovery()
 				}
 				if displayGuard.sleeping {
 					deferForDisplaySleep(reason)
@@ -371,7 +422,7 @@ func (s *Service) Run(ctx context.Context) error {
 				s.cfg.Logf("poll monitors failed: %v", err)
 				continue
 			}
-			switch displayGuard.Observe(monitors) {
+			switch observePower(monitors) {
 			case displaySleepEntered:
 				s.cfg.Logf("display sleep detected; pausing automatic switching")
 				deferForDisplaySleep("")
@@ -400,6 +451,9 @@ func (s *Service) Run(ctx context.Context) error {
 				scheduleMonitorTrigger("poll-change")
 			}
 		case next := <-triggerCh:
+			if next.reason == "wake-retry" && !recovering() {
+				continue
+			}
 			if displayGuard.sleeping {
 				deferForDisplaySleep(next.reason)
 				continue
@@ -412,7 +466,7 @@ func (s *Service) Run(ctx context.Context) error {
 			if !pending {
 				continue
 			}
-			err := s.applyBest(ctx)
+			err := s.applyBestAfterWake(ctx, recovering())
 			if errors.Is(err, errDisplaysSleeping) {
 				if displayGuard.MarkSleeping() {
 					s.cfg.Logf("display sleep detected; pausing automatic switching")
@@ -424,6 +478,14 @@ func (s *Service) Run(ctx context.Context) error {
 			settlingAfterWake = false
 			if err != nil {
 				s.cfg.Logf("apply failed: %v", err)
+			} else if recovering() {
+				checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				monitors, checkErr := s.client.Monitors(checkCtx)
+				cancel()
+				if checkErr == nil && s.wakeRecovered(monitors) {
+					stopRecovery()
+					s.cfg.Logf("display wake recovery complete")
+				}
 			}
 			s.signalChange()
 		}
@@ -503,6 +565,23 @@ func (s *Service) refreshLidState(ctx context.Context) {
 // a keypress, and an external monitor left undriven can take half a minute to
 // come back on its own.
 func (s *Service) wakeDisplays(ctx context.Context) {
+	// Use the same writer lock as previews and unmanage. A wake must not replay
+	// the old profile over an interactive preview or race a management handoff.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if !config.IsManaged(s.cfg.ConfigDir) {
+		return
+	}
+	// This uses the saved profile, without waiting for the external connector or
+	// a monitor-list query. It must precede global DPMS and the full profile apply.
+	s.pendingMu.Lock()
+	previewActive := s.pending != nil
+	s.pendingMu.Unlock()
+	if !previewActive {
+		if err := s.restoreOpenInternal(ctx); err != nil {
+			s.cfg.Logf("could not restore open laptop panel: %v", err)
+		}
+	}
 	wakeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -520,6 +599,10 @@ func (s *Service) wakeDisplays(ctx context.Context) {
 }
 
 func (s *Service) applyBest(ctx context.Context) error {
+	return s.applyBestAfterWake(ctx, false)
+}
+
+func (s *Service) applyBestAfterWake(ctx context.Context, recovering bool) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -545,7 +628,7 @@ func (s *Service) applyBest(ctx context.Context) error {
 	if len(monitors) == 0 {
 		return nil
 	}
-	if displayPowerState(monitors) == displayPowerAsleep {
+	if !recovering && displayPowerState(monitors) == displayPowerAsleep {
 		return errDisplaysSleeping
 	}
 
