@@ -65,9 +65,10 @@ type Service struct {
 	lidState       lid.State
 	lidSupported   bool
 
-	readLid      func(context.Context) (lid.State, error)
-	watchLid     func(context.Context, time.Duration) (<-chan lid.State, <-chan error)
-	watchSuspend func(context.Context) <-chan bool
+	readLid            func(context.Context) (lid.State, error)
+	watchLid           func(context.Context, time.Duration) (<-chan lid.State, <-chan error)
+	watchSuspend       func(context.Context) <-chan bool
+	hasRunningHyprland func(context.Context) (bool, error)
 }
 
 var errDisplaysSleeping = errors.New("displays are sleeping")
@@ -155,7 +156,7 @@ func New(client *hypr.Client, store *profile.Store, cfg Config) *Service {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	return &Service{
+	service := &Service{
 		client: client,
 		store:  store,
 		engine: apply.Engine{
@@ -172,6 +173,10 @@ func New(client *hypr.Client, store *profile.Store, cfg Config) *Service {
 		watchLid:     lid.Watch,
 		watchSuspend: suspend.Watch,
 	}
+	if client != nil {
+		service.hasRunningHyprland = client.HasRunningInstance
+	}
+	return service
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -181,6 +186,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.store.Ensure(); err != nil {
 		return err
 	}
+	s.neutralizeColdStartConfig(ctx)
 	s.ensureConfigInclude(ctx)
 
 	type trigger struct {
@@ -492,6 +498,60 @@ func (s *Service) Run(ctx context.Context) error {
 			s.signalChange()
 		}
 	}
+}
+
+// neutralizeColdStartConfig prevents a generated clamshell layout from
+// disabling the only available panel before Hyprland and the daemon can talk.
+// A daemon restart inside a live graphical session must leave the active layout
+// alone, so this runs only when no live Hyprland command socket exists.
+func (s *Service) neutralizeColdStartConfig(ctx context.Context) {
+	if !config.IsManaged(s.cfg.ConfigDir) || s.hasRunningHyprland == nil {
+		return
+	}
+	running, err := s.hasRunningHyprland(ctx)
+	if err != nil {
+		s.cfg.Logf("could not check for a running Hyprland instance before startup: %v", err)
+		return
+	}
+	if running {
+		return
+	}
+
+	paths, err := s.coldStartMonitorPaths()
+	if err != nil {
+		s.cfg.Logf("could not resolve generated monitor config before startup: %v", err)
+		return
+	}
+	for _, path := range paths {
+		changed, err := config.NeutralizeGeneratedMonitorsConfig(path)
+		if err != nil {
+			s.cfg.Logf("could not neutralize stale monitor config %s: %v", path, err)
+			continue
+		}
+		if changed {
+			s.cfg.Logf("neutralized stale monitor rules before Hyprland startup: %s", path)
+		}
+	}
+}
+
+func (s *Service) coldStartMonitorPaths() ([]string, error) {
+	if strings.TrimSpace(s.cfg.MonitorsConf) != "" || strings.TrimSpace(os.Getenv("HYPRMONCFG_MONITORS_CONF")) != "" {
+		path, err := config.ResolveMonitorsConfPath(s.cfg.MonitorsConf)
+		if err != nil {
+			return nil, err
+		}
+		return []string{path}, nil
+	}
+
+	legacy, err := config.HyprlandGeneratedPath(config.HyprConfigLegacy)
+	if err != nil {
+		return nil, err
+	}
+	lua, err := config.HyprlandGeneratedPath(config.HyprConfigLua)
+	if err != nil {
+		return nil, err
+	}
+	return []string{legacy, lua}, nil
 }
 
 // ensureConfigInclude makes the generated monitor config the last thing the
